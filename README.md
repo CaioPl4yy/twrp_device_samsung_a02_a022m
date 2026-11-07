@@ -1,15 +1,16 @@
 # TWRP device tree: Galaxy A02 (SM-A022M)
 
-Arvore para o A022M (MT6739, Android 11, firmware A022MUBS4BWL2), partindo da
-do A022F e corrigida com os dados reais do aparelho. NAO TESTADA.
+Device tree for the A022M (MT6739, Android 11, firmware A022MUBS4BWL2), based on the
+A022F tree and corrected with the device's actual data. NOT TESTED.
 
-## Antes de compilar
-1. `prebuilt/` ja esta preenchido (kernel, dtb.img, dtbo.img do recovery stock do A022M).
-2. Copiar `init.recovery.mt6739.rc` e `init.recovery.samsung.rc` da arvore do A022F
-   para `recovery/root/` (revisar antes: podem ter especificos do F).
-3. Conferir o `TODO` restante do `BoardConfig.mk` (brilho da tela).
+## Before building
+1. `prebuilt/` is already populated (kernel, dtb.img, and dtbo.img from the A022M stock recovery).
+2. Copy `init.recovery.mt6739.rc` and `init.recovery.samsung.rc` from the A022F tree
+to `recovery/root/` (review them first: they may contain A022F-specific settings).
+3. Check the remaining `TODO` items in `BoardConfig.mk` (screen brightness).
 
-## Compilar
-Actions > "Build TWRP A022M" > Run workflow. O resultado fica em Artifacts
-(`recovery.img` e `recovery.tar` para o Odin). O job falha se o recovery.img
-passar de 25165824 bytes (24 MiB).
+## Building
+Actions > "Build TWRP A022M" > Run workflow. The output can be found under Artifacts
+(`recovery.img` and `recovery.tar` for Odin). The job will fail if the `recovery.img`
+exceeds 25,165,824 bytes (24 MiB).
+Whoa! Did you think I’d leave you hanging? Nope! It’s already built! Check the releases.
