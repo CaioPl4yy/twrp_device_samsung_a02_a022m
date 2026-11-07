@@ -1,0 +1,184 @@
+name: Build TWRP A022M
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: "Branch do minimal manifest do TWRP"
+        default: "twrp-11"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout da device tree
+        uses: actions/checkout@v4
+        with:
+          path: devicetree
+
+      - name: Conferir arquivos da device tree
+        run: |
+          missing=0
+          for f in BoardConfig.mk device.mk twrp_a02.mk AndroidProducts.mk Android.mk \
+                   prebuilt/kernel prebuilt/dtb.img prebuilt/dtbo.img \
+                   recovery/root/recovery.fstab \
+                   recovery/root/init.recovery.mt6739.rc; do
+            if [ ! -s "devicetree/$f" ]; then
+              echo "FALTANDO: $f"
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ] || { echo "Envie os arquivos que faltam ao repositorio e rode de novo."; exit 1; }
+          echo "Todos os arquivos necessarios estao no repositorio."
+
+      - name: Liberar disco
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Swap extra
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          df -h /
+          free -h
+
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses-dev \
+            x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils \
+            xsltproc unzip fontconfig python3 python-is-python3 libncurses5 \
+            rsync bc ccache
+
+      - name: Sync do minimal manifest
+        run: |
+          mkdir -p ~/bin ~/twrp
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          git config --global user.name "builder"
+          git config --global user.email "builder@example.com"
+          cd ~/twrp
+          ~/bin/repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b "${{ inputs.manifest_branch }}"
+          for i in 1 2 3; do
+            ~/bin/repo sync -c -j"$(( $(nproc) * 2 ))" --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune && break
+            echo "Sync falhou (tentativa $i), tentando de novo..."
+            sleep 20
+          done
+          test -d build/make
+
+      - name: Colocar a device tree
+        run: |
+          mkdir -p ~/twrp/device/samsung
+          rm -rf ~/twrp/device/samsung/a02
+          cp -r "$GITHUB_WORKSPACE/devicetree" ~/twrp/device/samsung/a02
+          rm -rf ~/twrp/device/samsung/a02/.git ~/twrp/device/samsung/a02/.github
+
+      - name: Compilar recovery
+        run: |
+          cd ~/twrp
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          source build/envsetup.sh
+          lunch twrp_a02-eng
+          mka -j"$(nproc)" recoveryimage 2>&1 | tee ~/build.log
+
+      - name: Erros da compilacao
+        if: failure()
+        run: |
+          echo "=== linhas com erro (ate 40) ==="
+          grep -nE "error:|FAILED:|fatal error|ninja: build stopped" ~/build.log | head -40 || true
+          echo "=== fim do log ==="
+          tail -n 40 ~/build.log || true
+
+      - name: Conferir imagem e conteudo do TWRP
+        run: |
+          cd ~/twrp
+          IMG=out/target/product/a02/recovery.img
+          SIZE=$(stat -c%s "$IMG")
+          echo "recovery.img: $SIZE bytes (limite 25165824)"
+          mkdir -p "$GITHUB_WORKSPACE/artifact"
+          cp "$IMG" "$GITHUB_WORKSPACE/artifact/recovery.img"
+          (cd "$GITHUB_WORKSPACE/artifact" && tar -H ustar -c recovery.img > recovery.tar && ls -l)
+          cat > /tmp/check.py <<'PY'
+          import gzip, hashlib, struct, sys
+          img = open(sys.argv[1], 'rb').read()
+          pre = sys.argv[2]
+          ks, ka, rs, ra, ss, sa, ta, ps, hv, osv = struct.unpack_from('<10I', img, 8)
+          dts, dto, hs, dtbs, dtba = struct.unpack_from('<IQIIQ', img, 1632)
+          cmd = img[64:576].split(b'\0')[0].decode()
+          pg = lambda n: (n + ps - 1) // ps * ps
+          off = ps
+          kernel = img[off:off + ks]; off += pg(ks)
+          ramdisk = img[off:off + rs]
+          dtbo = img[dto:dto + dts]
+          o2 = dto + pg(dts)
+          dtb = img[o2:o2 + dtbs]
+          res = []
+          def chk(name, ok, crit=True):
+              res.append((name, ok, crit))
+          chk("header v2, page 2048", hv == 2 and ps == 2048)
+          chk("kernel 0x40008000 / ramdisk 0x45000000 / tags 0x44000000", (ka, ra, ta) == (0x40008000, 0x45000000, 0x44000000))
+          chk("dtb_addr 0x44000000", dtba == 0x44000000)
+          chk("cmdline bootopt=64S3,32S1,32S1", "bootopt=64S3,32S1,32S1" in cmd)
+          for nome, a, b in (("kernel", kernel, "kernel"), ("dtb", dtb, "dtb.img"), ("dtbo", dtbo, "dtbo.img")):
+              chk(nome + " identico ao prebuilt", hashlib.md5(a).digest() == hashlib.md5(open(pre + "/" + b, "rb").read()).digest())
+          chk("ramdisk gzip", ramdisk[:2] == b'\x1f\x8b')
+          data = gzip.decompress(ramdisk)
+          al = lambda n: (n + 3) & ~3
+          p = 0; files = {}
+          while data[p:p + 6] == b'070701':
+              h = data[p:p + 110]
+              f = lambda i: int(h[6 + 8 * i:14 + 8 * i], 16)
+              fs, ns = f(6), f(11)
+              name = data[p + 110:p + 110 + ns - 1].decode(errors='replace')
+              p = al(p + 110 + ns)
+              files[name] = data[p:p + fs]
+              p = al(p + fs)
+          rec = files.get('system/bin/recovery', b'')
+          chk("system/bin/recovery e ELF ARM 32 bits", rec[:4] == b'\x7fELF' and rec[4] == 1 and int.from_bytes(rec[18:20], 'little') == 40)
+          chk("binario recovery e o TWRP", b'twrpMtp' in rec)
+          chk("twres (tema) presente", any(n.startswith('twres/') for n in files))
+          rc = files.get('init.recovery.mt6739.rc', b'')
+          chk("init.recovery.mt6739.rc com configfs e musb-hdrc", b'sys.usb.configfs 1' in rc and b'musb-hdrc' in rc)
+          fst = files.get('recovery.fstab', b'')
+          chk("recovery.fstab com /super e /data f2fs", b'/super' in fst and b'f2fs' in fst)
+          chk("fastbootd presente", 'system/bin/fastbootd' in files, False)
+          chk("tamanho <= 24 MiB", len(img) <= 25165824)
+          bad = 0
+          print("## Conferencia do recovery.img")
+          for name, ok, crit in res:
+              print(("- OK    " if ok else ("- FALHA " if crit else "- aviso ")) + name)
+              bad += (not ok) and crit
+          sys.exit(1 if bad else 0)
+          PY
+          python3 /tmp/check.py "$IMG" "$GITHUB_WORKSPACE/devicetree/prebuilt" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$SIZE" -le 25165824
+
+      - name: Reunir log
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifact"
+          cp ~/build.log "$GITHUB_WORKSPACE/artifact/build.log" 2>/dev/null || true
+
+      - name: Publicar resultado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-a022m
+          path: ${{ github.workspace }}/artifact/
+          if-no-files-found: ignore
